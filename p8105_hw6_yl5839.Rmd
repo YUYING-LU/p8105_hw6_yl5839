@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 
 ```{r}
 library(tidyverse)
-
+library(glmnet)
 theme_set(theme(legend.position = "bottom"))
 
 options(
@@ -42,6 +42,7 @@ weather_df =
 
 
 ```{r}
+set.seed(1000)
 boot_fit = 
   weather_df |> 
   modelr::bootstrap(n = 5000) |> 
@@ -50,7 +51,6 @@ boot_fit =
     results = map(models, broom::tidy),
     glance = map(models, broom::glance))|> 
     select(-strap, -models)
-
 
 log_beta = boot_fit |> 
   unnest(results) |> 
@@ -81,15 +81,229 @@ labels <- as_labeller(c(
   log_b = "log(hat(beta)[0]%*%hat(beta)[1])"), label_parsed)
 
 est_df |> 
-  ggplot(aes(x = estimate, fill = term, color = term)) +
+  ggplot(aes(x = estimate)) +
   geom_histogram(binwidth = 0.01, alpha = 0.7) +
   labs(title = "Distribution of Estimates from 5000 Bootstrap Samples") +
-  facet_grid(~term, labeller = labels)
+  facet_grid(~term, labeller = labels, scales = "free_x")
   
 ```
+
+
+Using 5000 bootstrap samples, we produce the estimates of $r^2$ and log($\hat{\beta}_0\times\hat{\beta}_1$) and plot the histogram figure to illustrate the distribution of these two quantities. The shape of the distribution is like a bell curve. Also we calculate and the mean value, standard deviation, $2.5\%$ and $97.5\%$ quantiles of each term.
+
+
+
+```{r}
+CI_df = 
+  est_df |> 
+  group_by(term) |> 
+  summarize(
+    lower_bound = round(quantile(estimate, 0.025),3),
+    upper_bound = round(quantile(estimate, 0.975),3),
+    mean = round(mean(estimate),3),
+    sd = round(sd(estimate),3)
+  ) |> 
+  mutate(CI = paste0('(',lower_bound,', ',upper_bound,')')) 
+``` 
+
+For estimates of $r^2$, the mean value is `r CI_df$mean[2]`, the standard deviation is `r CI_df$sd[2]` and the $95\%$ confidence interval is `r CI_df$CI[2]`;
+
+For estimates of log($\hat{\beta}_0\times\hat{\beta}_1$), the mean value is `r CI_df$mean[1]`, the standard deviation is `r CI_df$sd[1]` and the $95\%$ confidence interval is `r CI_df$CI[1]`.
+
+
+
+# Problem 2
+
+## Data Importing and Wrangling
+
+```{r}
+url = "https://raw.githubusercontent.com/washingtonpost/data-homicides/master/homicide-data.csv"
+homi_df = read_csv(url)
+homi_df = 
+  homi_df |> 
+  mutate(city_state = paste0(city, ', ', state),
+         resolved = as.numeric(disposition == "Closed by arrest"),
+         victim_age = as.numeric(victim_age)) |> 
+  filter(!city_state %in% c('Dallas, TX', 'Phoenix, AZ', 'Kansas City, MO', 'Tulsa, AL ')) |> 
+  filter(victim_race %in% c('White', 'Black')) |> 
+  mutate(victim_race = fct_relevel(victim_race, "White")) |> 
+  select(city_state, resolved, victim_age, victim_race, victim_sex) |> 
+  drop_na()
+```
+
+## Apply `glm` to City of Baltimore, MD
+
+```{r}
+set.seed(1000)
+fit_glm = 
+  homi_df |> 
+  filter(city_state == 'Baltimore, MD') |> 
+  glm(resolved ~ victim_age + victim_race + victim_sex, 
+                 data = _, family = binomial())
+
+summary_fit_glm =
+  fit_glm|> 
+  broom::tidy(conf.int = TRUE, exponentiate = TRUE)|>
+  mutate(CI = paste0('(', round(conf.low,3),', ', round(conf.high,3),')')) |> 
+  select(term, OR = estimate, CI)
+
+summary_fit_glm |> 
+  knitr::kable(digits = 3)
+
+```
+
+The estimate and $95\%$ confidence interval of the adjusted odds ratio are `r summary_fit_glm$OR[4]` and `r summary_fit_glm$CI[4]` for solving homicides comparing male victims to female victims keeping all other variables fixed.
+
+
+## Apply `glm` to All Cities
+
+Noticed that `Tulsa, AL` only has one value for the outcome `resolved`, so we should exclude this city before applying the `glm` to all the cities.
+
+```{r}
+summary_cities = 
+  homi_df |>  
+  nest(data = resolved:victim_sex) |> 
+  mutate(mean_resolved = map_dbl(data, \(df) mean(df$resolved))) |> 
+  filter(!mean_resolved %in% c(1,0)) |> 
+  mutate(
+    model = map(data, \(df) glm(data = df, resolved ~ victim_age + victim_race + victim_sex,  family = binomial())),
+    tidy_model = map(model, \(df) broom::tidy(df, conf.int = TRUE, exponentiate = TRUE))
+  )  |> 
+  unnest(tidy_model) |>                
+  filter(term == "victim_sexMale") |> 
+  select(city_state, OR = estimate, conf.low, conf.high) |> 
+  mutate(city_state = fct_reorder(city_state, OR))
+
+summary_cities |> 
+  knitr::kable(digits = 3)
+```
+
+## Plot
+
+```{r, fig.height= 10, fig.width=6}
+summary_cities |> 
+  ggplot(aes(x = city_state, y = OR)) +
+  geom_point(size = 2, color = "#DF6604") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3, color = "darkgray", size = 0.8) +
+  coord_flip() +
+  labs(
+    x = "City",
+    y = "OR"
+  ) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),  
+    axis.title.x = element_text(size = 14, face = "bold"),  
+    axis.title.y = element_text(size = 14, face = "bold"),  
+    axis.text.x = element_text(size = 12, color = "black"), 
+    axis.text.y = element_text(size = 12, color = "black"), 
+    panel.grid.major = element_line(color = "lightgray", size = 0.5),  
+    panel.grid.minor = element_blank()  
+  ) 
+
+```
+
+
+**Comment:** 
+
+```{r}
+mean_df = 
+  summary_cities |> 
+  filter(OR > 1)
+
+mean_df
+```
+
+- There are `r nrow(mean_df)` cities has the estimated OR larger than 1
+
+
+```{r}
+reject_null = 
+  summary_cities |> 
+  filter(conf.high < 1|conf.low > 1)
+
+reject_null
+```
+
+- There are `r nrow(reject_null)` cities whose $95\%$ confidence interval for OR doesn't contain the null value 1. For these cities, we notice that the $95\%$ confidence is smaller than 1, so we have $95\%$ confidence to say the solving homicides of male victims is significantly less than that of female victims.
+
+
+# Problem 3
+
+
+## Load and Clean the Data
+
+```{r}
+bwt_df = 
+  read_csv("data/birthweight.csv") |> 
+  janitor::clean_names() |>
+  mutate(
+    babysex = 
+        case_match(babysex,
+            1 ~ "male",
+            2 ~ "female"
+        ),
+    babysex = fct_infreq(babysex),
+    frace = 
+        case_match(frace,
+            1 ~ "white",
+            2 ~ "black", 
+            3 ~ "asian", 
+            4 ~ "puerto rican", 
+            8 ~ "other"),
+    frace = fct_infreq(frace),
+    mrace = 
+        case_match(mrace,
+            1 ~ "white",
+            2 ~ "black", 
+            3 ~ "asian", 
+            4 ~ "puerto rican",
+            8 ~ "other"),
+    mrace = fct_infreq(mrace),
+    malform = as.logical(malform)) |> 
+  sample_n(200)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ```{r}
 
 ```
+
 
